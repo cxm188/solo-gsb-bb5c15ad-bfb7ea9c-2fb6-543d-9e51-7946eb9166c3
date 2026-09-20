@@ -18,7 +18,7 @@ from .summary import WeightSummaryError, summarize
 
 app = FastAPI(
     title="GS1 Element String Parser",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "Parses GS1 input into structured, ordered AI elements. Accepts raw "
         "scan strings (FNC1 / ASCII 29 separated) and GS1 Digital Link URIs "
@@ -36,7 +36,11 @@ app = FastAPI(
         "min_remaining_days (default 0): only stock whose actual expiry "
         "date is on or after as_of + min_remaining_days may serve that "
         "demand, and the weight ruled out by that threshold is reported "
-        "per demand as excluded_weight."
+        "per demand as excluded_weight. A demand may set package_mode to "
+        "'whole' to treat each eligible scan as an indivisible package: "
+        "the subset with the smallest overage is chosen (lexicographically "
+        "smallest FEFO index tuple on ties), overage is reported and more "
+        "than 30 eligible packages for one demand fails with 422."
     ),
 )
 
@@ -154,6 +158,23 @@ class Demand(BaseModel):
         ),
         examples=[30],
     )
+    package_mode: Literal["splittable", "whole"] = Field(
+        default="splittable",
+        description=(
+            'How stock may be taken: "splittable" (default) aggregates scans '
+            'by GTIN, batch and expiry and may split the final group; '
+            '"whole" treats every eligible scan as one indivisible package. '
+            'In whole mode the subset of packages with total weight >= '
+            "quantity and the smallest overage is selected; equal overage "
+            "breaks to the lexicographically smallest tuple of FEFO indices "
+            "(actual expiry date, then original scan order). If no subset "
+            "reaches quantity, all eligible packages are taken. Each "
+            "allocation then corresponds to one selected scan and returns in "
+            "FEFO order. More than 30 eligible packages for one demand is "
+            "rejected with 422 naming the demand_index."
+        ),
+        examples=["whole"],
+    )
 
 
 class WeightPickPlanRequest(BaseModel):
@@ -194,9 +215,15 @@ class WeightPickPlanRequest(BaseModel):
         ...,
         description=(
             "One demand per GTIN; quantity is expressed in target_unit. "
-            "A GTIN repeated across demands is rejected with 422."
+            "A GTIN repeated across demands is rejected with 422. Each "
+            "demand may opt into package_mode 'whole' (indivisible scans)."
         ),
-        examples=[[{"gtin": "09501101530003", "quantity": 3}]],
+        examples=[
+            [
+                {"gtin": "09501101530003", "quantity": 3},
+                {"gtin": "00000000000017", "quantity": 5, "package_mode": "whole"},
+            ]
+        ],
     )
 
     @field_validator("as_of", mode="before")
@@ -223,9 +250,10 @@ class Allocation(BaseModel):
     )
     weight: float = Field(
         description=(
-            "Net weight taken from this group, in the target unit, rounded to "
+            "Net weight taken from this source, in the target unit, rounded to "
             "six decimal places with round-half-even. Computed internally with "
-            "Decimal, never float."
+            "Decimal, never float. In whole package_mode each allocation is one "
+            "selected scan and the weight is its full, unsplit package weight."
         )
     )
 
@@ -241,7 +269,17 @@ class DemandPlan(BaseModel):
         description="Total weight allocated to the demand (six decimal places)"
     )
     shortage: float = Field(
-        description="quantity - fulfilled; 0.000000 when fully satisfied (six decimal places)"
+        description=(
+            "quantity - fulfilled when positive, else 0.000000; never negative "
+            "(six decimal places)"
+        )
+    )
+    overage: float = Field(
+        description=(
+            "fulfilled - quantity when whole-package selection exceeds the "
+            "demand, else 0.000000; always 0.000000 in splittable mode "
+            "(six decimal places)"
+        )
     )
     excluded_weight: float = Field(
         description=(
@@ -250,7 +288,14 @@ class DemandPlan(BaseModel):
             "(six decimal places)"
         )
     )
-    allocations: list[Allocation]
+    allocations: list[Allocation] = Field(
+        description=(
+            "Selected sources in allocation order: FEFO group order in "
+            "splittable mode (the last group may be partial); in whole mode "
+            "one entry per selected scan, ordered FEFO (actual expiry date, "
+            "then original scan order)."
+        )
+    )
 
 
 class WeightPickPlanResponse(BaseModel):
@@ -334,6 +379,7 @@ def _build_pick_plan_response(result: dict) -> Response:
                 "quantity": _six(demand["quantity"]),
                 "fulfilled": _six(demand["fulfilled"]),
                 "shortage": _six(demand["shortage"]),
+                "overage": _six(demand["overage"]),
                 "excluded_weight": _six(demand["excluded_weight"]),
                 "allocations": [
                     {
@@ -385,7 +431,10 @@ def weight_pick_plan(req: WeightPickPlanRequest) -> Response:
         result = pick_plan(
             req.scans,
             req.target_unit,
-            [(d.gtin, d.quantity, d.min_remaining_days) for d in req.demands],
+            [
+                (d.gtin, d.quantity, d.min_remaining_days, d.package_mode)
+                for d in req.demands
+            ],
             req.as_of,
         )
     except (WeightSummaryError, DemandValidationError) as exc:

@@ -295,7 +295,7 @@ curl -X POST http://localhost:8080/weight-summary \
 一次提交多条扫码字符串和一组按 GTIN 的需求，按 **FEFO（先到期先出）** 为每个
 需求分配净重，并按每个需求的剩余效期门槛过滤库存。
 
-- 请求体：`{"scans": [...], "target_unit": "kg", "as_of": "2025-01-15", "demands": [{"gtin": "...", "quantity": 5, "min_remaining_days": 30}]}`。
+- 请求体：`{"scans": [...], "target_unit": "kg", "as_of": "2025-01-15", "demands": [{"gtin": "...", "quantity": 5, "min_remaining_days": 30, "package_mode": "splittable"}]}`。
   `target_unit` 可选，仅接受 `"kg"` / `"lb"`，默认 `"kg"`；`as_of` **必填**，为
   `YYYY-MM-DD` 格式的真实日期（计划基准日），缺失或非法返回 `422`；`scans` 中的
   每一项既可以是元素串，也可以是 GS1 Digital Link URI（与 `/parse` 完全一致）。
@@ -306,26 +306,41 @@ curl -X POST http://localhost:8080/weight-summary \
   错误（结构同 `/parse`）。
 - `demands` 每项含 `gtin` 与 `quantity`（`quantity` 以 `target_unit` 计，必须大于 0，
   按 `Decimal` 精确解析，JSON number 与字符串均可），以及可选的
-  `min_remaining_days`（**非负整数，默认 0**）。**同一 GTIN 重复出现返回
-  `422`**，`detail.demand_index` 给出出错下标；`min_remaining_days` 为负数时同样
-  返回 `422` 并以 `detail.demand_index` 定位。
+  `min_remaining_days`（**非负整数，默认 0**）与 `package_mode`（仅接受
+  `"splittable"` / `"whole"`，**默认 `"splittable"`**，可按需求分别指定）。**同一
+  GTIN 重复出现返回 `422`**，`detail.demand_index` 给出出错下标；`min_remaining_days`
+  为负数时同样返回 `422` 并以 `detail.demand_index` 定位。
 - 效期门槛：对每个需求，仅**实际效期不早于 `as_of + min_remaining_days` 天**的
-  库存分组可参与分配（边界日期当天可用）；AI 17 日字段 `00` 仍按当月最后一天
-  解释（如 `250200` = 2025-02-28，闰年 `240200` = 2024-02-29）。被门槛排除的库存
-  **不计入 `fulfilled`**，缺口仍计入 `shortage`。
-- 汇总与分配：先按 **GTIN + 批号 + AI 17 原值** 汇总可用重量（换算到
-  `target_unit`），再对每个需求的 GTIN 在**合格**分组中按 **AI 17 实际日期升序**
-  执行 FEFO；实际日期相同的分组保持批次**首次出现**顺序；**最后一批允许部分
-  分配**。
+  库存可参与分配（边界日期当天可用，两种模式一致）；AI 17 日字段 `00` 仍按当月
+  最后一天解释（如 `250200` = 2025-02-28，闰年 `240200` = 2024-02-29）。被门槛
+  排除的库存**不计入 `fulfilled`**，缺口仍计入 `shortage`。
+- 汇总与分配（`package_mode: "splittable"`，默认）：先按 **GTIN + 批号 + AI 17
+  原值** 汇总可用重量（换算到 `target_unit`），再对每个需求的 GTIN 在**合格**
+  分组中按 **AI 17 实际日期升序** 执行 FEFO；实际日期相同的分组保持批次
+  **首次出现**顺序；**最后一批允许部分分配**。
+- 整包模式（`package_mode: "whole"`）：每条合格扫描视为**不可拆分的独立包裹**，
+  不做汇总、不允许部分取用；实际效期、效期门槛与 `Decimal` 单位换算规则与默认
+  模式完全一致，FEFO 排序键为（实际效期、原扫描顺序）。若存在总重量达到
+  `quantity` 的子集，选择**超量（overage）最小**者；超量相同的多个子集取 FEFO
+  索引序列**字典序最小**者（即尽量保留最早到期包裹的前提下，同分时优先取下标
+  更靠前的包裹）；若任何子集都无法达到 `quantity`，则选取**全部合格包裹**，差额
+  计入 `shortage`。`allocations` 中每条对应一个入选扫描，携带该包裹的批号、AI 17
+  原值与完整重量，并按 FEFO 返回。单个需求的**合格包裹超过 30 个**时整个请求
+  返回 `422`（错误码 `TOO_MANY_PACKAGES`），`detail.demand_index` 定位该需求；
+  零重量扫描不计为包裹，也不计入 30 个上限。
 - 换算、汇总、比较与分配全程使用 `Decimal` 与固定换算系数
   **1 lb = 0.45359237 kg**（千克→磅按其精确倒数换算），仅在响应时按**六位小数
   half-even（银行家舍入）**输出为 JSON 数字（如 `2.513000`）。
 - 响应：`target_unit` 加与请求同序的 `demands` 数组。每项含 `gtin`、`quantity`
-  （回显）、`fulfilled`（已分配总量）、`shortage`（缺口，`quantity - fulfilled`）、
-  `excluded_weight`（同 GTIN 因门槛被排除的重量合计，以 `target_unit` 计，无排除
-  时为 `0.000000`）与 `allocations`（按分配顺序，每条含 `batch`、`expiry`
-  （AI 17 原值 YYMMDD）与 `weight`）。`scans` 为空数组时每个需求都是全额
-  `shortage`（`fulfilled` 为 `0.000000`，`allocations` 为空）。
+  （回显）、`fulfilled`（已分配总量）、`shortage`（缺口，`quantity - fulfilled`
+  为正时取该值，否则为 `0.000000`，**恒不为负**）、`overage`（超量，
+  `fulfilled - quantity` 为正时取该值，否则为 `0.000000`；splittable 模式恒为
+  `0.000000`）、`excluded_weight`（同 GTIN 因门槛被排除的重量合计，以
+  `target_unit` 计，无排除时为 `0.000000`）与 `allocations`（splittable 模式按
+  分配顺序、每条对应一个分组且末条可为部分量，含 `batch`、`expiry`（AI 17 原值
+  YYMMDD）与 `weight`；whole 模式每条对应一个入选扫描、按 FEFO 返回且
+  `weight` 为完整包裹重量）。`scans` 为空数组时每个需求都是全额 `shortage`
+  （`fulfilled` 为 `0.000000`，`allocations` 为空）。
 
 请求示例（三个批次效期不同，需求 12 kg，目标单位 kg，`as_of` 之前无库存到期）：
 
@@ -347,6 +362,7 @@ curl -X POST http://localhost:8080/weight-pick-plan \
       "quantity": 12.000000,
       "fulfilled": 12.000000,
       "shortage": 0.000000,
+      "overage": 0.000000,
       "excluded_weight": 0.000000,
       "allocations": [
         {"batch": "EARLY", "expiry": "250131", "weight": 2.000000},
@@ -354,6 +370,63 @@ curl -X POST http://localhost:8080/weight-pick-plan \
       ]
     }
   ]
+}
+```
+
+### 整包模式 `package_mode: "whole"`
+
+整包模式下每条扫描是一个不可拆分的包裹，系统在合格包裹中寻找**达到需求量且
+超量最小**的子集；超量相同的多个子集按 FEFO 索引序列字典序取最小者。下面三个
+包裹按 FEFO 排序为 2 kg（1 月到期）、1.5 kg（2 月）、1.5 kg（3 月），需求
+2.5 kg：贪心会取 `2 + 1.5 = 3.5`（超量 1.0），而最优子集是两个 1.5 kg 包裹
+（`3.0`，超量 `0.5`）：
+
+```bash
+curl -X POST http://localhost:8080/weight-pick-plan \
+  -H "Content-Type: application/json" \
+  -d '{"target_unit": "kg", "as_of": "2025-01-01", "scans": ["01095011015300031725013110BIG\u001d3103002000", "01095011015300031725022810A\u001d3103001500", "01095011015300031725033110B\u001d3103001500"], "demands": [{"gtin": "09501101530003", "quantity": 2.5, "package_mode": "whole"}]}'
+```
+
+每条入选扫描对应一条 `allocations`（不再按 GTIN+批号+效期汇总），按 FEFO 返回，
+`weight` 是完整包裹重量；超出的 0.5 kg 计入 `overage`，`shortage` 保持
+`0.000000`：
+
+```json
+{
+  "target_unit": "kg",
+  "demands": [
+    {
+      "gtin": "09501101530003",
+      "quantity": 2.500000,
+      "fulfilled": 3.000000,
+      "shortage": 0.000000,
+      "overage": 0.500000,
+      "excluded_weight": 0.000000,
+      "allocations": [
+        {"batch": "A", "expiry": "250228", "weight": 1.500000},
+        {"batch": "B", "expiry": "250331", "weight": 1.500000}
+      ]
+    }
+  ]
+}
+```
+
+若任何子集都无法达到 `quantity`（上例若需求改为 6 kg），则选取全部合格包裹，
+此时 `fulfilled = 5.0`、`shortage = 1.0`、`overage = 0.0`。效期门槛在整包模式
+下同样生效：被门槛排除的包裹既不参与选择，其重量仍计入 `excluded_weight`。
+单个需求的合格包裹超过 30 个时返回 `422`：
+
+```json
+{
+  "detail": {
+    "demand_index": 0,
+    "error": {
+      "error": "TOO_MANY_PACKAGES",
+      "message": "demand 0: package_mode 'whole' allows at most 30 eligible packages, found 31",
+      "expected": "at most 30 eligible packages for package_mode 'whole'",
+      "found": "31"
+    }
+  }
 }
 ```
 
@@ -376,6 +449,7 @@ curl -X POST http://localhost:8080/weight-pick-plan \
       "quantity": 2.000000,
       "fulfilled": 2.000000,
       "shortage": 0.000000,
+      "overage": 0.000000,
       "excluded_weight": 2.000000,
       "allocations": [
         {"batch": "FRESH", "expiry": "250228", "weight": 2.000000}
@@ -394,7 +468,7 @@ curl -X POST http://localhost:8080/weight-pick-plan \
 ```
 
 ```json
-{"target_unit": "kg", "demands": [{"gtin": "09501101530003", "quantity": 2.500000, "fulfilled": 0.000000, "shortage": 2.500000, "excluded_weight": 0.000000, "allocations": []}]}
+{"target_unit": "kg", "demands": [{"gtin": "09501101530003", "quantity": 2.500000, "fulfilled": 0.000000, "shortage": 2.500000, "overage": 0.000000, "excluded_weight": 0.000000, "allocations": []}]}
 ```
 
 扫描错误与 `/weight-summary` 同形（`detail.scan_index` + 原始错误）；需求中 GTIN
@@ -487,7 +561,7 @@ app/
   main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan）
   gs1.py      # GS1 元素串 / Digital Link URI 解析与校验核心
   summary.py  # 多扫描重量汇总：Decimal 重建、单位换算、GTIN+批号分组
-  pickplan.py # FEFO 拣货计划：GTIN+批号+效期汇总、as_of+min_remaining_days 效期门槛、按实际效期分配需求
+  pickplan.py # FEFO 拣货计划：GTIN+批号+效期汇总、效期门槛、splittable/whole（整包子集优选）两种 package_mode
 tests/
   test_parse.py
   test_weight_summary.py
