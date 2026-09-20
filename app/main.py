@@ -18,7 +18,7 @@ from .summary import WeightSummaryError, summarize
 
 app = FastAPI(
     title="GS1 Element String Parser",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "Parses GS1 input into structured, ordered AI elements. Accepts raw "
         "scan strings (FNC1 / ASCII 29 separated) and GS1 Digital Link URIs "
@@ -36,7 +36,12 @@ app = FastAPI(
         "min_remaining_days (default 0): only stock whose actual expiry "
         "date is on or after as_of + min_remaining_days may serve that "
         "demand, and the weight ruled out by that threshold is reported "
-        "per demand as excluded_weight."
+        "per demand as excluded_weight. Every demand may instead set "
+        'package_mode "whole" to treat each eligible scan as an indivisible '
+        "package: the plan then picks the package subset reaching the "
+        "demanded quantity with the smallest overage (reported as overage; "
+        "shortage never goes negative), or every eligible package when no "
+        "subset suffices."
     ),
 )
 
@@ -154,6 +159,20 @@ class Demand(BaseModel):
         ),
         examples=[30],
     )
+    package_mode: Literal["splittable", "whole"] = Field(
+        default="splittable",
+        description=(
+            '"splittable" (default) allocates weight freely, allowing a '
+            'partial final allocation. "whole" treats every eligible scan as '
+            "an indivisible package: the plan picks the package subset "
+            "reaching quantity with the smallest overage (ties broken by the "
+            "lexicographically smallest FEFO index sequence), or every "
+            "eligible package when no subset reaches quantity. A demand with "
+            "more than 30 eligible packages is rejected with 422 naming the "
+            "demand_index."
+        ),
+        examples=["whole"],
+    )
 
 
 class WeightPickPlanRequest(BaseModel):
@@ -242,6 +261,12 @@ class DemandPlan(BaseModel):
     )
     shortage: float = Field(
         description="quantity - fulfilled; 0.000000 when fully satisfied (six decimal places)"
+    )
+    overage: float = Field(
+        description=(
+            "fulfilled - quantity when a whole-package plan overshoots the "
+            "demand; always 0.000000 for splittable demands (six decimal places)"
+        )
     )
     excluded_weight: float = Field(
         description=(
@@ -334,6 +359,7 @@ def _build_pick_plan_response(result: dict) -> Response:
                 "quantity": _six(demand["quantity"]),
                 "fulfilled": _six(demand["fulfilled"]),
                 "shortage": _six(demand["shortage"]),
+                "overage": _six(demand["overage"]),
                 "excluded_weight": _six(demand["excluded_weight"]),
                 "allocations": [
                     {
@@ -385,7 +411,10 @@ def weight_pick_plan(req: WeightPickPlanRequest) -> Response:
         result = pick_plan(
             req.scans,
             req.target_unit,
-            [(d.gtin, d.quantity, d.min_remaining_days) for d in req.demands],
+            [
+                (d.gtin, d.quantity, d.min_remaining_days, d.package_mode)
+                for d in req.demands
+            ],
             req.as_of,
         )
     except (WeightSummaryError, DemandValidationError) as exc:

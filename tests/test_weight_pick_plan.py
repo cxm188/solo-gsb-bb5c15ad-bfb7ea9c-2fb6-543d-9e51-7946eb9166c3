@@ -37,10 +37,12 @@ def scan(gtin=GTIN_OK, expiry="250131", batch=None, weight="3103002000"):
     return "".join(parts)
 
 
-def demand(gtin=GTIN_OK, quantity="1", min_remaining_days=None):
+def demand(gtin=GTIN_OK, quantity="1", min_remaining_days=None, package_mode=None):
     d = {"gtin": gtin, "quantity": quantity}
     if min_remaining_days is not None:
         d["min_remaining_days"] = min_remaining_days
+    if package_mode is not None:
+        d["package_mode"] = package_mode
     return d
 
 
@@ -232,10 +234,19 @@ def test_response_shape():
         "quantity",
         "fulfilled",
         "shortage",
+        "overage",
         "excluded_weight",
         "allocations",
     }
     assert set(d["allocations"][0]) == {"batch", "expiry", "weight"}
+
+
+def test_splittable_overage_is_always_zero():
+    resp = plan([scan(), scan(batch="B", expiry="250228")], [demand(quantity="3")])
+    d = resp.json()["demands"][0]
+    assert d["fulfilled"] == 3.0
+    assert d["overage"] == 0.0
+    assert '"overage":0.000000' in resp.text
 
 
 # ------------------------------------------------------- units and conversion
@@ -667,3 +678,289 @@ def test_non_string_scan_entry_is_422():
     )
     assert resp.status_code == 422
     assert resp.json()["detail"][0]["loc"] == ["body", "scans", 0]
+
+
+# ---------------------------------------------------------- whole package_mode
+
+
+def whole_demand(gtin=GTIN_OK, quantity="1", min_remaining_days=None):
+    return demand(
+        gtin=gtin,
+        quantity=quantity,
+        min_remaining_days=min_remaining_days,
+        package_mode="whole",
+    )
+
+
+def test_whole_mode_picks_subset_with_smallest_overage():
+    # FEFO order weights 2, 3, 4 kg; subsets reaching 5: {2,3}=5, {2,4}=6, {3,4}=7.
+    resp = plan(
+        [
+            scan(batch="A", expiry="250131", weight="3103002000"),
+            scan(batch="B", expiry="250228", weight="3103003000"),
+            scan(batch="C", expiry="250331", weight="3103004000"),
+        ],
+        [whole_demand(quantity="5")],
+    )
+    assert resp.status_code == 200
+    d = resp.json()["demands"][0]
+    assert [(a["batch"], a["weight"]) for a in d["allocations"]] == [
+        ("A", 2.0),
+        ("B", 3.0),
+    ]
+    assert d["fulfilled"] == 5.0
+    assert d["shortage"] == 0.0
+    assert d["overage"] == 0.0
+
+
+def test_whole_mode_overage_when_no_exact_subset():
+    resp = plan(
+        [scan(batch="A", weight="3103003000"), scan(batch="B", weight="3103003000")],
+        [whole_demand(quantity="4")],
+    )
+    d = resp.json()["demands"][0]
+    assert d["fulfilled"] == 6.0
+    assert d["overage"] == 2.0
+    assert d["shortage"] == 0.0  # never negative
+    assert '"overage":2.000000' in resp.text
+    assert '"shortage":0.000000' in resp.text
+
+
+def test_whole_mode_prefers_overage_over_fefo_order():
+    # FEFO order weights 2, 5 kg; {5} overshoots less than {2,5}.
+    resp = plan(
+        [
+            scan(batch="EARLY", expiry="250131", weight="3103002000"),
+            scan(batch="LATE", expiry="250228", weight="3103005000"),
+        ],
+        [whole_demand(quantity="4")],
+    )
+    d = resp.json()["demands"][0]
+    assert [(a["batch"], a["weight"]) for a in d["allocations"]] == [("LATE", 5.0)]
+    assert d["overage"] == 1.0
+
+
+def test_whole_mode_tie_breaks_by_lexicographic_fefo_index_sequence():
+    # FEFO order is A, B, C (by expiry, not scan order); every pair totals
+    # 4 kg, and [A, B] is the lexicographically smallest index sequence.
+    resp = plan(
+        [
+            scan(batch="C", expiry="250331"),
+            scan(batch="B", expiry="250228"),
+            scan(batch="A", expiry="250131"),
+        ],
+        [whole_demand(quantity="4")],
+    )
+    d = resp.json()["demands"][0]
+    assert [a["batch"] for a in d["allocations"]] == ["A", "B"]
+    assert d["fulfilled"] == 4.0
+    assert d["overage"] == 0.0
+
+
+def test_whole_mode_allocations_are_one_per_scan_not_aggregated():
+    # Two identical scans share one (gtin, batch, expiry) group, but whole
+    # mode treats them as two indivisible 2 kg packages.
+    resp = plan([scan(batch="S"), scan(batch="S")], [whole_demand(quantity="3")])
+    d = resp.json()["demands"][0]
+    assert d["allocations"] == [
+        {"batch": "S", "expiry": "250131", "weight": 2.0},
+        {"batch": "S", "expiry": "250131", "weight": 2.0},
+    ]
+    assert d["fulfilled"] == 4.0
+    assert d["overage"] == 1.0
+    assert d["shortage"] == 0.0
+
+
+def test_whole_mode_takes_everything_when_quantity_unreachable():
+    resp = plan(
+        [scan(batch="A", expiry="250228"), scan(batch="B", expiry="250131")],
+        [whole_demand(quantity="10")],
+    )
+    d = resp.json()["demands"][0]
+    # all eligible packages, returned in FEFO order
+    assert [a["batch"] for a in d["allocations"]] == ["B", "A"]
+    assert d["fulfilled"] == 4.0
+    assert d["shortage"] == 6.0
+    assert d["overage"] == 0.0
+
+
+def test_whole_mode_empty_scans_are_full_shortage():
+    resp = plan([], [whole_demand(quantity="2.5")])
+    d = resp.json()["demands"][0]
+    assert d["fulfilled"] == 0.0
+    assert d["shortage"] == 2.5
+    assert d["overage"] == 0.0
+    assert d["allocations"] == []
+
+
+def test_whole_mode_respects_shelf_life_threshold():
+    # as_of 2025-01-16 + 15 days = 2025-01-31: OLD (2025-01-30) is excluded.
+    resp = plan(
+        [
+            scan(batch="OLD", expiry="250130"),
+            scan(batch="P1", expiry="250131", weight="3103003000"),
+            scan(batch="P2", expiry="250228", weight="3103004000"),
+        ],
+        [whole_demand(quantity="5", min_remaining_days=15)],
+        as_of="2025-01-16",
+    )
+    d = resp.json()["demands"][0]
+    assert [(a["batch"], a["weight"]) for a in d["allocations"]] == [
+        ("P1", 3.0),
+        ("P2", 4.0),
+    ]
+    assert d["fulfilled"] == 7.0
+    assert d["overage"] == 2.0
+    assert d["excluded_weight"] == 2.0
+
+
+def test_whole_mode_converts_units_with_exact_decimal():
+    # 25.13 lb * 0.45359237 = 11.3987762581 kg, taken as one package.
+    resp = plan([scan(weight="3202002513")], [whole_demand(quantity="11")])
+    d = resp.json()["demands"][0]
+    assert d["fulfilled"] == 11.398776
+    assert d["overage"] == 0.398776
+    assert d["shortage"] == 0.0
+    assert '"overage":0.398776' in resp.text
+
+
+def test_whole_mode_zero_weight_package_joins_lexicographically_smallest_subset():
+    # Subsets reaching 2 kg: {FULL} and {EMPTY,FULL} both total exactly 2;
+    # the index sequence [0, 1] is lexicographically smaller than [1].
+    resp = plan(
+        [
+            scan(batch="EMPTY", expiry="250131", weight="3103000000"),
+            scan(batch="FULL", expiry="250228"),
+        ],
+        [whole_demand(quantity="2")],
+    )
+    d = resp.json()["demands"][0]
+    assert [(a["batch"], a["weight"]) for a in d["allocations"]] == [
+        ("EMPTY", 0.0),
+        ("FULL", 2.0),
+    ]
+    assert d["fulfilled"] == 2.0
+    assert d["overage"] == 0.0
+
+
+def test_whole_mode_more_than_30_eligible_packages_is_422():
+    resp = plan([scan() for _ in range(31)], [whole_demand(quantity="5")])
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["demand_index"] == 0
+    assert detail["error"]["error"] == "TOO_MANY_PACKAGES"
+    assert detail["error"]["found"] == "31"
+    assert set(detail) == {"demand_index", "error"}
+
+
+def test_whole_mode_exactly_30_eligible_packages_is_ok():
+    resp = plan([scan() for _ in range(30)], [whole_demand(quantity="5")])
+    assert resp.status_code == 200
+    d = resp.json()["demands"][0]
+    # three 2 kg packages are the smallest-overage subset reaching 5 kg
+    assert len(d["allocations"]) == 3
+    assert d["fulfilled"] == 6.0
+    assert d["overage"] == 1.0
+
+
+def test_whole_mode_limit_counts_only_eligible_packages():
+    # 31 scans but one expires before as_of: 30 eligible -> accepted.
+    scans = [scan(expiry="250110")] + [scan(expiry="250331") for _ in range(30)]
+    resp = plan(scans, [whole_demand(quantity="5")], as_of="2025-02-01")
+    assert resp.status_code == 200
+    d = resp.json()["demands"][0]
+    assert d["fulfilled"] == 6.0
+    assert d["excluded_weight"] == 2.0
+
+
+def test_whole_mode_limit_is_per_demand_and_reports_its_index():
+    scans = [scan()] + [scan(gtin=GTIN2) for _ in range(31)]
+    resp = plan(
+        scans,
+        [demand(quantity="1"), whole_demand(gtin=GTIN2, quantity="5")],
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["demand_index"] == 1
+
+
+def test_splittable_demand_has_no_package_limit():
+    resp = plan([scan() for _ in range(31)], [demand(quantity="5")])
+    assert resp.status_code == 200
+    assert resp.json()["demands"][0]["fulfilled"] == 5.0
+
+
+def test_mixed_package_modes_in_one_request():
+    resp = plan(
+        [
+            scan(batch="W", weight="3103003000"),
+            scan(gtin=GTIN2, batch="S", weight="3103002000"),
+            scan(gtin=GTIN2, batch="S2", expiry="250228", weight="3103002000"),
+        ],
+        [whole_demand(quantity="2"), demand(gtin=GTIN2, quantity="3")],
+    )
+    assert resp.status_code == 200
+    first, second = resp.json()["demands"]
+    # whole: the single 3 kg package overshoots less than anything else
+    assert first["allocations"] == [{"batch": "W", "expiry": "250131", "weight": 3.0}]
+    assert first["overage"] == 1.0
+    # splittable: FEFO with a partial final allocation
+    assert [(a["batch"], a["weight"]) for a in second["allocations"]] == [
+        ("S", 2.0),
+        ("S2", 1.0),
+    ]
+    assert second["overage"] == 0.0
+
+
+def test_explicit_splittable_mode_matches_default():
+    scans = [scan(batch="A"), scan(batch="B", expiry="250228")]
+    expected = plan(scans, [demand(quantity="3")]).json()
+    explicit = plan(scans, [demand(quantity="3", package_mode="splittable")]).json()
+    assert explicit == expected
+
+
+def test_unknown_package_mode_is_422():
+    resp = plan([scan()], [demand(package_mode="half")])
+    assert resp.status_code == 422
+
+
+def test_invalid_package_mode_rejected_in_direct_call():
+    import pytest
+
+    from app.pickplan import DemandValidationError, pick_plan
+
+    with pytest.raises(DemandValidationError) as excinfo:
+        pick_plan([], "kg", [(GTIN_OK, Decimal(1), 0, "half")], date(2024, 1, 1))
+    detail = excinfo.value.detail
+    assert detail["demand_index"] == 0
+    assert detail["error"]["error"] == "INVALID_PACKAGE_MODE"
+
+
+def test_whole_mode_is_exact_decimal_in_direct_result():
+    from app.pickplan import pick_plan
+
+    result = pick_plan(
+        [scan(weight="3202002513")],  # 11.3987762581 kg exactly
+        "kg",
+        [(GTIN_OK, Decimal("11"), 0, "whole")],
+        date(2024, 1, 1),
+    )
+    d = result["demands"][0]
+    assert d["fulfilled"] == Decimal("11.3987762581")
+    assert d["overage"] == Decimal("0.3987762581")
+    assert d["shortage"] == Decimal(0)
+    assert d["allocations"][0]["weight"] == Decimal("11.3987762581")
+    assert not isinstance(d["overage"], float)
+
+
+def test_direct_call_with_3_tuple_still_defaults_to_splittable():
+    from app.pickplan import pick_plan
+
+    result = pick_plan(
+        [scan()],
+        "kg",
+        [(GTIN_OK, Decimal("1"), 0)],
+        date(2024, 1, 1),
+    )
+    d = result["demands"][0]
+    assert d["fulfilled"] == Decimal(1)
+    assert d["overage"] == Decimal(0)
